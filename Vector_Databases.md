@@ -1,4 +1,4 @@
-# Phase 16 — Vector Databases
+# Vector Databases
 
 > Finding the nearest vectors among a hundred million, in ten milliseconds, without exact search. This phase is about the index parameters that decide whether your retrieval is fast, accurate, or cheap — you get to pick two.
 
