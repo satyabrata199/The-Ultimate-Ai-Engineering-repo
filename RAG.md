@@ -1,4 +1,4 @@
-# Phase 15 — RAG (Retrieval-Augmented Generation)
+# RAG (Retrieval-Augmented Generation)
 
 > Give the model the right facts at the right moment. Almost every "the AI is wrong" complaint is a **retrieval** failure, not a generation failure — so this is where you spend your effort.
 
