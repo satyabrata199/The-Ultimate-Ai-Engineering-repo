@@ -1,4 +1,4 @@
-# Phase 22 — AI Evaluation
+# AI Evaluation
 
 > You cannot improve what you cannot measure, and LLM output resists ordinary measurement. This phase is how to build a measurement system you can actually trust — and how to avoid the ones that feel rigorous and aren't.
 
