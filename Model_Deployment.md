@@ -1,4 +1,4 @@
-# Phase 19 — Model Deployment
+# Model Deployment
 
 > Deploying an AI service is ordinary backend deployment plus five things that break the usual assumptions: minute-long cold starts, GPU scheduling, 40-second requests, long-lived streams, and cost per request measured in cents.
 
