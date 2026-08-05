@@ -1,4 +1,4 @@
-# Phase 21 — Production AI Systems
+# Production AI Systems
 
 > Everything from Phases 12–20 assembled into the shape a real product needs. This phase is the *system*: the request path, the safety layers around it, and the loops that keep it improving.
 
