@@ -1,4 +1,4 @@
-# Phase 14 — AI Memory Systems
+# AI Memory Systems
 
 > LLMs are stateless. Every "memory" feature is you deciding what to put back into the context window on the next call. This phase is about making that decision well.
 
