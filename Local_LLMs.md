@@ -1,4 +1,4 @@
-# Phase 18 — Local & Self-Hosted LLMs
+# Local & Self-Hosted LLMs
 
 > Running the model yourself. The decision is almost never about capability — it's about data residency, cost at volume, and latency floor. This phase is the arithmetic and the tooling.
 
