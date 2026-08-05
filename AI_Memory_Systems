@@ -1,0 +1,514 @@
+# Phase 14 — AI Memory Systems
+
+> LLMs are stateless. Every "memory" feature is you deciding what to put back into the context window on the next call. This phase is about making that decision well.
+
+**After this phase you can:** design a memory system that fits a token budget, choose between summarisation and retrieval, and avoid the two failure modes — a context that grows until it breaks, and a "memory" that recalls the wrong thing confidently.
+
+---
+
+## 1. The Core Truth
+
+```
+ THE MODEL REMEMBERS NOTHING.
+
+ Every API call is independent. "Memory" means:
+   you STORE something, then you SELECT part of it, then you INJECT it
+   into the next prompt.
+
+ So every memory system answers three questions:
+   ① WHAT do we store?          (raw turns? summaries? extracted facts?)
+   ② HOW do we select?          (recency? similarity? importance?)
+   ③ WHAT is the token budget?  (this constrains everything above)
+```
+
+**The budget frames the whole problem:**
+
+```
+ Context window                      128,000 tokens
+ − system prompt + tools                 -2,000
+ − retrieved documents (RAG)            -12,000
+ − reserved for the answer               -4,000
+ ─────────────────────────────────────────────
+ = available for MEMORY                ~110,000
+
+ But you should NOT use it all:
+   • prefill is O(n²) — long contexts have quadratic TTFT cost
+   • "lost in the middle" — recall degrades in the centre of a long context
+   • cost is linear in prompt tokens, on EVERY turn
+
+ → A practical memory budget is 2,000–8,000 tokens, not 100,000.
+```
+
+---
+
+## 2. Working Memory vs Long-Term Memory
+
+```
+ ┌─────────────────────────────────────────────────────────────────────────┐
+ │ WORKING MEMORY — what is in the prompt right now                        │
+ │   the current conversation, retrieved chunks, the scratchpad            │
+ │   lives in: the context window                                          │
+ │   lifetime: this request                                                │
+ │   bounded by: the token budget                                          │
+ ├─────────────────────────────────────────────────────────────────────────┤
+ │ LONG-TERM MEMORY — everything you could recall                          │
+ │   full transcripts, extracted facts, summaries, user preferences        │
+ │   lives in: Postgres + a vector store                                   │
+ │   lifetime: until deleted                                               │
+ │   bounded by: disk (i.e. effectively unbounded)                         │
+ └─────────────────────────────────────────────────────────────────────────┘
+
+ THE ENTIRE ENGINEERING PROBLEM is the arrow between them:
+ which slice of long-term memory enters working memory this turn?
+```
+
+---
+
+## 3. Conversation Memory (Buffer)
+
+The simplest form: keep the last N turns verbatim.
+
+```python
+class ConversationBuffer:
+    """Keep the most recent turns that fit a token budget."""
+
+    def __init__(self, max_tokens: int = 4000, model: str = "gpt-4o-mini"):
+        self._max, self._enc = max_tokens, tiktoken.encoding_for_model(model)
+
+    def build(self, messages: list[Message]) -> list[Message]:
+        kept, used = [], 0
+        # Walk BACKWARD from the newest — recency is what matters most.
+        for msg in reversed(messages):
+            cost = len(self._enc.encode(msg.content)) + 4   # + role overhead
+            if used + cost > self._max:
+                break
+            kept.append(msg)
+            used += cost
+        kept.reverse()
+
+        # ⚠ Never start with an assistant message or a dangling tool result —
+        # some providers reject it, and all of them get confused by it.
+        while kept and kept[0].role != "user":
+            kept.pop(0)
+        return kept
+```
+
+**Use it for:** short sessions, support chats, anything under ~20 turns.
+**Fails when:** the conversation is long, or something important was said 50 turns ago.
+
+**The details that break in production:**
+- Truncate by **tokens, not message count** — one message can be 10k tokens.
+- Never split a tool call from its tool result; drop both or keep both.
+- Always keep the system prompt, and keep it **first** (prefix caching).
+
+---
+
+## 4. Summary Memory
+
+Compress older turns into a running summary; keep recent turns verbatim.
+
+```python
+class SummaryMemory:
+    """Recent turns verbatim + a rolling summary of everything before."""
+
+    async def build(self, conv_id: UUID) -> list[Message]:
+        state = await self._repo.get_memory(conv_id)   # summary + last_summarised_idx
+        recent = await self._repo.messages_after(conv_id, state.last_idx)
+
+        if self._tokens(recent) > self._threshold:
+            to_fold = recent[:-self._keep_recent]
+            state.summary = await self._fold(state.summary, to_fold)
+            state.last_idx += len(to_fold)
+            await self._repo.save_memory(conv_id, state)
+            recent = recent[-self._keep_recent:]
+
+        messages = []
+        if state.summary:
+            messages.append(Message(role="system",
+                                    content=f"Summary of earlier conversation:\n{state.summary}"))
+        return messages + recent
+
+    async def _fold(self, previous: str, new_turns: list[Message]) -> str:
+        return await self._llm.complete(f"""Update this conversation summary.
+
+Preserve: decisions made, user preferences, facts stated, open questions,
+and any identifiers (names, IDs, dates). Drop: pleasantries and repetition.
+Keep under 500 words.
+
+Existing summary:
+{previous or "(none)"}
+
+New turns:
+{format_turns(new_turns)}
+
+Updated summary:""", temperature=0.2)
+```
+
+**Use it for:** long-running conversations where the *thread* matters more than exact wording.
+
+**The failure mode nobody warns you about — summary drift:**
+```
+ Each summarisation is lossy. Summarising a summary compounds the loss.
+ After 10 folds, specific details ("the user's account is org_4471") are gone
+ and the model starts inventing plausible substitutes.
+
+ MITIGATIONS
+   ✔ Summarise from the ORIGINAL messages, not summary-of-summary,
+     whenever you can afford the tokens
+   ✔ Extract structured facts separately (§6) and never summarise those
+   ✔ Keep the raw transcript in Postgres — the summary is a cache, not the truth
+   ✔ Explicitly instruct the summariser to preserve identifiers and numbers
+```
+
+**Cost note:** summarisation is an extra LLM call. Do it asynchronously after the response is sent, not on the user's critical path.
+
+---
+
+## 5. Vector Memory
+
+Embed past turns; retrieve the semantically relevant ones for the current question.
+
+```python
+class VectorMemory:
+    async def remember(self, conv_id: UUID, org_id: UUID, msg: Message) -> None:
+        # Skip trivial turns — "ok", "thanks" pollute retrieval.
+        if len(msg.content) < 40:
+            return
+        await self._store.upsert(collection=f"mem_{org_id.hex}", points=[{
+            "id": str(msg.id),
+            "vector": await self._embedder.embed(msg.content),
+            "payload": {"conv_id": str(conv_id), "org_id": str(org_id),
+                        "role": msg.role, "text": msg.content,
+                        "ts": msg.created_at.isoformat()}}])
+
+    async def recall(self, query: str, conv_id: UUID, org_id: UUID,
+                     k: int = 5) -> list[Message]:
+        hits = await self._store.search(
+            await self._embedder.embed(query),
+            collection=f"mem_{org_id.hex}",
+            filters={"org_id": str(org_id), "conv_id": str(conv_id)},  # ⚠ SCOPED
+            top_k=k)
+        return [Message(**h.payload) for h in hits]
+```
+
+**Use it for:** long histories where relevance beats recency ("what did we decide about pricing?").
+
+**Where it goes wrong:**
+```
+ ❌ Retrieved turns arrive OUT OF ORDER and without context — a fragment of a
+    dialogue is often meaningless alone.  → re-sort by timestamp; include the
+    adjacent turn.
+ ❌ Embeddings don't encode negation. "I don't want email alerts" retrieves for
+    "email alerts" and the model may act on the opposite.
+ ❌ Retrieving conversational filler.  → only embed substantive turns.
+ ❌ MISSING TENANT/CONVERSATION SCOPE — the classic cross-tenant leak, arriving
+    through memory instead of RAG. Filter inside the vector search, always.
+```
+
+**Practical shape:** vector memory works far better over *extracted facts* than over raw dialogue turns. Which leads to:
+
+---
+
+## 6. Knowledge Memory (Extracted Facts)
+
+Instead of storing what was *said*, store what is *true*. This is the highest-quality form of long-term memory.
+
+```python
+class Fact(BaseModel):
+    subject: str = Field(description="Who or what this is about, e.g. 'user'")
+    predicate: str = Field(description="The relation, e.g. 'prefers'")
+    object: str = Field(description="The value, e.g. 'dark mode'")
+    confidence: float = Field(ge=0, le=1)
+    source_message_id: UUID
+
+class KnowledgeMemory:
+    async def extract(self, turns: list[Message]) -> list[Fact]:
+        """Run ASYNCHRONOUSLY after the response — never on the hot path."""
+        return await self._llm.extract(
+            """Extract durable facts about the user or their situation.
+
+            Include: stated preferences, constraints, goals, identifiers, decisions.
+            Exclude: transient context, questions, anything about this conversation
+            only. If nothing durable was stated, return an empty list.""",
+            turns, schema=list[Fact])
+
+    async def upsert(self, user_id: UUID, facts: list[Fact]) -> None:
+        for fact in facts:
+            # Same subject+predicate → UPDATE, don't accumulate contradictions.
+            existing = await self._repo.find(user_id, fact.subject, fact.predicate)
+            if existing and existing.object != fact.object:
+                await self._repo.supersede(existing.id, fact)   # keep history
+            else:
+                await self._repo.insert(user_id, fact)
+```
+
+**Why this is better than raw vector memory:**
+- Facts are **compact** — 30 facts fit in ~500 tokens; 30 turns cost 6,000.
+- Facts can be **updated and contradicted** cleanly (supersede, don't append).
+- Facts are **inspectable and editable by the user** — which is a product feature *and* a GDPR requirement.
+- Facts don't drift the way summaries do.
+
+**Injection is cheap:**
+```
+ Known about this user:
+ - prefers concise answers
+ - works in the finance department
+ - timezone: Europe/London
+ - previously rejected the annual plan (2026-01-14)
+```
+
+---
+
+## 7. Reflection
+
+The agent periodically reviews its own history and writes higher-level conclusions.
+
+```python
+REFLECTION_PROMPT = """Review the interactions below and produce insights that
+would improve future responses.
+
+Focus on: recurring user needs, what worked, what failed, patterns worth
+remembering. Be specific — "the user prefers tables to prose" is useful;
+"the user asks questions" is not.
+
+Return 1–5 insights, or none if nothing generalisable emerged."""
+
+# Trigger: every N interactions, or on a schedule — NEVER on the request path.
+```
+
+**Use it for:** long-lived assistants that should improve over weeks.
+**Be sceptical because:** reflections are model-generated opinions that then influence future behaviour. A wrong reflection ("the user dislikes detail") persists and compounds. Store confidence, expire old reflections, and let users see and delete them.
+
+---
+
+## 8. Scratchpad (Task Memory)
+
+Working notes *within* a single task — the agent's short-term thinking space.
+
+```python
+class Scratchpad:
+    """Ephemeral, task-scoped, discarded when the task completes."""
+
+    def __init__(self, max_entries: int = 50):
+        self._entries: list[str] = []
+        self._max = max_entries
+
+    def note(self, text: str) -> None:
+        self._entries.append(text)
+        if len(self._entries) > self._max:
+            self._entries.pop(0)              # bound it — agents loop
+
+    def render(self) -> str:
+        return "\n".join(f"- {e}" for e in self._entries)
+```
+
+Used for: tool results accumulated across steps, intermediate calculations, a plan being executed, things already tried (so the agent doesn't repeat a failing action).
+
+**Crucially: bound it.** An agent in a loop will fill an unbounded scratchpad until the context overflows. Cap the entries and cap the total tokens.
+
+---
+
+## 9. Hybrid Memory — The Production Design
+
+No single strategy is sufficient. Real systems layer them:
+
+```
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ SYSTEM PROMPT + TOOLS                              ~2,000 tokens     │
+ │   stable, cached by the provider                                     │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ KNOWLEDGE MEMORY — extracted facts                   ~500 tokens     │
+ │   compact, durable, user-editable                                    │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ SUMMARY — folded older conversation                  ~800 tokens     │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ VECTOR RECALL — relevant older turns                 ~700 tokens     │
+ │   only when the current question suggests older context matters      │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ RECENT TURNS — verbatim                            ~3,000 tokens     │
+ │   the last 5–10 exchanges                                            │
+ ├──────────────────────────────────────────────────────────────────────┤
+ │ CURRENT MESSAGE                                                      │
+ └──────────────────────────────────────────────────────────────────────┘
+                                              TOTAL ~7,000 tokens
+```
+
+```python
+class HybridMemory:
+    async def build_context(self, conv_id: UUID, user_id: UUID, org_id: UUID,
+                            query: str, budget: int = 7000) -> list[Message]:
+        # Fetch every source CONCURRENTLY — they're independent I/O.
+        async with asyncio.TaskGroup() as tg:
+            facts   = tg.create_task(self._knowledge.get(user_id, limit=30))
+            summary = tg.create_task(self._summary.get(conv_id))
+            recalled = tg.create_task(self._vector.recall(query, conv_id, org_id, k=3))
+            recent  = tg.create_task(self._repo.recent_messages(conv_id, limit=10))
+
+        messages: list[Message] = []
+        remaining = budget
+
+        # Allocate in PRIORITY order — the last section to be truncated is
+        # the most recent conversation, because that is what the user expects.
+        for section in (
+            self._render_facts(facts.result()),
+            self._render_summary(summary.result()),
+            self._render_recall(recalled.result(), conv_id),
+        ):
+            cost = self._tokens(section)
+            if section and cost <= remaining * 0.4:      # cap each auxiliary section
+                messages.append(section)
+                remaining -= cost
+
+        messages += self._fit(recent.result(), remaining)
+        return messages
+```
+
+**The ordering rule:** stable content first (system → facts → summary), variable content last (recall → recent → current). This maximises the cacheable prefix — the same principle as Phase 12's prompt engineering, applied to memory.
+
+---
+
+## 10. Memory Compression
+
+Techniques for fitting more meaning into fewer tokens, roughly by increasing sophistication:
+
+| Technique | How | Compression | Loss |
+|---|---|---|---|
+| **Truncation** | drop oldest turns | unbounded | total, for what's dropped |
+| **Deduplication** | drop repeated content | 10–30% | none |
+| **Summarisation** | LLM folds turns into prose | 5–20× | details, over generations |
+| **Fact extraction** | turns → structured triples | 20–50× | everything not extracted |
+| **Selective retention** | keep only turns marked important | varies | judgement-dependent |
+| **Hierarchical** | recent verbatim, older summarised, oldest as facts | 10× overall | graceful |
+
+```python
+def compress_tool_results(results: list[ToolResult], budget: int) -> str:
+    """Tool outputs are the biggest, most compressible part of agent context.
+    A 50 KB API response usually matters as three fields."""
+    out = []
+    for r in results:
+        if r.is_error:
+            out.append(f"{r.name}: ERROR — {r.error[:200]}")       # keep errors
+        elif len(r.content) > 2000:
+            out.append(f"{r.name}: {summarise_structured(r.content, max_chars=500)}")
+        else:
+            out.append(f"{r.name}: {r.content}")
+    return "\n".join(out)
+```
+
+**Where the tokens actually are, in a typical agent:** tool results, then retrieved documents, then conversation. Compress in that order — compressing conversation first is optimising the smallest term.
+
+---
+
+## 11. Memory Retrieval — When to Recall
+
+Recalling on every turn is wasteful. Most turns need no long-term memory at all.
+
+```python
+async def should_recall(query: str, recent: list[Message]) -> bool:
+    """A cheap gate before an expensive retrieval."""
+    # 1. Explicit reference to the past — always recall.
+    if re.search(r"\b(earlier|before|last time|previously|you said|we discussed|"
+                 r"remember|as I mentioned)\b", query, re.I):
+        return True
+    # 2. First turn — nothing to recall.
+    if len(recent) <= 2:
+        return False
+    # 3. Pronouns with no local antecedent suggest older context.
+    if re.match(r"^(it|that|this|those|they)\b", query.strip(), re.I) and len(recent) < 4:
+        return True
+    # 4. Short follow-ups usually refer to the immediately preceding turn.
+    if len(query.split()) < 5:
+        return False
+    return False        # default: don't. Recency handles most conversation.
+```
+
+**Retrieval quality rules:**
+```
+ ✔ Filter by conversation AND tenant INSIDE the vector search, never after
+ ✔ Re-sort retrieved turns chronologically before injecting
+ ✔ Include the adjacent turn — a lone reply is often meaningless
+ ✔ Label them clearly: "From an earlier conversation on 2026-02-14:"
+   (unlabelled old turns get mistaken for current context)
+ ✔ Set a similarity floor — a weak match is worse than nothing
+ ✔ Deduplicate against what's already in the recent window
+```
+
+---
+
+## 12. Persistent Memory — Storage
+
+```python
+# Postgres = the source of truth
+class Message(Base):
+    id, conversation_id, org_id, role, content, tokens, created_at
+    # append-only; never mutated
+
+class ConversationMemory(Base):
+    conversation_id (pk), summary, last_summarised_index, updated_at
+    # a CACHE derived from messages — safely rebuildable
+
+class UserFact(Base):
+    id, user_id, org_id, subject, predicate, object, confidence
+    source_message_id, created_at, superseded_at, superseded_by
+    # never hard-delete — supersede, so history is auditable
+
+# Vector store = the retrieval index
+#   collection per tenant; payload carries org_id, conv_id, ts, role
+```
+
+**Rules:**
+```
+ ✔ Raw messages are the source of truth; summaries and vectors are derived
+   and rebuildable. Never let a summary be the only copy of something.
+ ✔ Facts are superseded, not deleted — you need the history for audit
+   and for "why does it think that about me?"
+ ✔ Every memory read is tenant-scoped. Memory is a data-leak surface
+   exactly like RAG.
+ ✔ Retention: define it, honour it, and make deletion actually delete —
+   including vectors and derived summaries.
+ ✔ Users must be able to VIEW and DELETE what the system remembers about
+   them. This is a GDPR/CCPA requirement, not a nice-to-have.
+```
+
+---
+
+## Common Mistakes
+
+```
+❌ Unbounded conversation growth → context overflow at turn 40, in production
+❌ Truncating by message count rather than tokens
+❌ Splitting a tool call from its tool result during truncation
+❌ Summarising summaries repeatedly → drift, then confident invention
+❌ Summarising on the request path (adds seconds to every response)
+❌ Vector memory without tenant/conversation filters → cross-user leakage
+❌ Injecting retrieved turns out of chronological order and unlabelled
+❌ Storing raw dialogue when extracted facts would be 20× smaller and clearer
+❌ Unbounded scratchpad → an agent loop fills the context
+❌ Treating summaries as the source of truth (they're a lossy cache)
+❌ No way for a user to see or delete their stored memory
+❌ Recalling on every turn when recency would have sufficed
+❌ Variable content before stable content → provider prefix caching never engages
+```
+
+---
+
+## Checklist
+
+```
+[ ] Explicit token budget per memory section, enforced by measurement
+[ ] Truncation by tokens, preserving tool-call/result pairs
+[ ] Raw messages persisted as the source of truth; derived state rebuildable
+[ ] Summarisation runs asynchronously, from originals where affordable
+[ ] Facts extracted, superseded rather than duplicated, user-visible
+[ ] Vector recall filtered by tenant + conversation INSIDE the search
+[ ] Recalled turns re-sorted chronologically and clearly labelled
+[ ] Scratchpad bounded in entries and tokens
+[ ] Stable content first for prefix caching
+[ ] Recall gated — not every turn needs long-term memory
+[ ] Retention policy defined; deletion removes messages, vectors, and summaries
+[ ] Memory sections measured in production (which one actually improves answers?)
+```
+
+---
+
+**Next:** Phase 15 — RAG, where the same retrieval machinery is applied to documents instead of conversation.

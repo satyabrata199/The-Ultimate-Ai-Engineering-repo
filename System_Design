@@ -1,0 +1,598 @@
+# Phase 20 — System Design
+
+> Distributed systems fundamentals, filtered for what AI workloads actually stress. The patterns are classical; what's different is the scale of the numbers — a 4-second dependency you don't control, costing money per call.
+
+**Scope note.** Several topics here are covered in depth in **`BackendForAi.md`** — caching (Ch 17), rate limiting (Ch 2/4), idempotency (Ch 1/11), retries and circuit breakers (Ch 8), queues and DLQs (Ch 11), observability (Ch 21). This phase gives the system-design framing and the AI-specific pressure points, and points there for implementation.
+
+---
+
+## 1. What AI Workloads Change
+
+```
+ CLASSIC WEB SERVICE              AI SERVICE
+ ──────────────────               ──────────
+ requests: 50 ms                  requests: 4,000 ms          ← 80×
+ cost/request: ~$0.000001         cost/request: ~$0.001–0.50  ← 1000×+
+ stateless and cheap to retry     retries cost real money
+ CPU-bound at scale               waiting-bound; GPU-bound upstream
+ failures are rare                upstream 429/5xx are ROUTINE
+ responses are cacheable          responses are non-deterministic
+ capacity = requests/second       capacity = CONCURRENT CONNECTIONS
+
+ CONSEQUENCE: patterns that are optional in a normal backend —
+ circuit breakers, idempotency, backpressure, budget enforcement —
+ are MANDATORY here.
+```
+
+---
+
+## 2. Monolith vs Microservices
+
+```
+ START WITH A MODULAR MONOLITH. Almost always.
+
+ ✔ One deploy, one database, one trace, one place to debug
+ ✔ Refactoring across boundaries is a rename, not a migration
+ ✔ No network calls between your own components
+ ✘ Everything scales together
+ ✘ One bad deploy affects everything
+
+ SPLIT WHEN THERE IS A CONCRETE REASON:
+   • different SCALING profiles      ← the real reason in AI systems
+   • different HARDWARE (GPU vs CPU) ← the other real reason
+   • different LANGUAGES
+   • team ownership boundaries at ~50+ engineers
+```
+
+**The AI-specific split that's always correct:**
+
+```
+   API tier          stateless, CPU, scales on request concurrency, 2 s start
+   Inference tier    GPU, scales on queue depth, 3 min start
+   Worker tier       CPU/GPU, scales on queue latency, long-running jobs
+
+ These have genuinely different scaling reasons and hardware.
+ Splitting them is not premature — it's the first correct decomposition.
+```
+
+**Design the monolith so it can split.** Group routers by domain, keep URL prefixes aligned with those domains, and enforce layering (api → service → repository). Then extracting a domain is a load-balancer rule, not a client migration.
+
+---
+
+## 3. API Gateway
+
+```
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ GATEWAY DOES                     │ APPLICATION DOES                  │
+ ├──────────────────────────────────┼───────────────────────────────────┤
+ │ TLS termination                  │ per-user / per-tenant rate limits  │
+ │ IP-based rate limiting           │ token QUOTAS and spend budgets     │
+ │ Request size limits              │ object-level authorization         │
+ │ Coarse auth (is the JWT valid?)  │ business validation                │
+ │ Routing to services              │ model routing and fallback         │
+ │ Response caching                 │ semantic caching                   │
+ └──────────────────────────────────┴───────────────────────────────────┘
+
+ THE RULE: if it needs application knowledge (tenants, models, tokens),
+ it belongs in the app. Otherwise push it to the gateway — cheaper,
+ faster, and already battle-tested.
+
+ NEVER push object-level authorization to the gateway. It doesn't know
+ your domain model, and that is where breaches come from.
+```
+
+**AI-specific gateway note:** an LLM gateway (LiteLLM proxy, Portkey, or your own) is a *second* gateway, in front of providers rather than in front of your API. It handles virtual keys, per-team budgets, provider fallback, and spend tracking. Worth adopting early — those are things you'd otherwise build twice.
+
+---
+
+## 4. Event-Driven Systems
+
+```
+ SYNCHRONOUS                        EVENT-DRIVEN
+ caller waits for the result        caller fires and continues
+ tight coupling                     loose coupling
+ failure propagates immediately     failure is contained and retryable
+ simple to reason about             eventual consistency to reason about
+
+ USE EVENTS FOR: document ingestion, embedding generation, evals,
+                 billing rollups, webhooks, notifications, index rebuilds
+ USE SYNC FOR:   anything the user is waiting on
+```
+
+### Kafka vs RabbitMQ vs Redis Streams
+
+| | **Kafka** | **RabbitMQ** | **Redis Streams** |
+|---|---|---|---|
+| Model | distributed **log** | message **broker** | lightweight log |
+| Retention | configurable, replayable | consumed and gone | capped by length/time |
+| Ordering | per partition | per queue | per stream |
+| Throughput | very high (M/s) | high (100k/s) | high (100k/s) |
+| Replay | **yes — the key feature** | no | yes, within retention |
+| Ops burden | high | medium | **low (you have Redis)** |
+| Best for | event sourcing, analytics, multiple consumers of the same stream | task routing, complex topologies | **most AI backends** |
+
+```
+ THE PRACTICAL ANSWER FOR MOST AI SYSTEMS:
+   Redis Streams (or a Redis-backed queue like ARQ/Celery) is enough.
+
+ You already run Redis for caching and rate limits. Adding Kafka means
+ ZooKeeper/KRaft, partition management, consumer-group debugging, and a
+ new on-call surface — for a workload doing thousands of events per day.
+
+ ADOPT KAFKA WHEN: you need replay, multiple independent consumers of the
+ same stream, or genuinely high throughput. Not before.
+```
+
+```python
+# Redis Streams — consumer groups give at-least-once with acknowledgement
+await redis.xgroup_create("ingest", "workers", id="0", mkstream=True)
+
+while True:
+    entries = await redis.xreadgroup("workers", consumer_id,
+                                     {"ingest": ">"}, count=10, block=5000)
+    for _, messages in entries:
+        for msg_id, fields in messages:
+            try:
+                await process(fields)
+                await redis.xack("ingest", "workers", msg_id)   # ack AFTER work
+            except Exception:
+                log.exception("processing_failed", msg_id=msg_id)
+                # unacked → reclaimable by XAUTOCLAIM after idle timeout
+
+# Reclaim messages from dead consumers
+await redis.xautoclaim("ingest", "workers", consumer_id, min_idle_time=60_000)
+```
+
+---
+
+## 5. Message Queues, Idempotency, and DLQs
+
+*(Implementation: `BackendForAi.md` Ch 11.)*
+
+```
+ THE DELIVERY GUARANTEE YOU ACTUALLY GET IS AT-LEAST-ONCE.
+
+ Exactly-once delivery is not achievable in a distributed system.
+ Exactly-once EFFECT is — via at-least-once delivery + IDEMPOTENT processing.
+
+ → EVERY TASK MUST BE IDEMPOTENT. This is not optional; it is the price
+   of durability.
+```
+
+**Four techniques that cover nearly every case:**
+
+```python
+async def process_document(job_id: str) -> dict:
+    job = await repo.get(job_id)
+    if job.status == "completed":              # ① status guard
+        return job.result
+
+    chunks = chunk(await parse(job))
+    await vector_store.upsert([                # ③ upsert, not insert
+        Point(id=deterministic_id(job.document_id, c.index),   # ② stable IDs
+              vector=v, payload=...) for c, v in zip(chunks, vectors)])
+
+    await billing.charge_once(                 # ④ idempotency key on side effects
+        org_id=job.org_id, amount=len(chunks),
+        idempotency_key=f"ingest:{job.document_id}")
+    await repo.mark_completed(job_id)
+```
+
+**Idempotency for LLM calls specifically:**
+```python
+# A retry after a network blip must not charge the customer twice.
+won = await redis.set(f"idem:{key}", '{"status":"in_progress"}', nx=True, ex=86400)
+if not won:
+    stored = json.loads(await redis.get(f"idem:{key}"))
+    if stored["status"] == "in_progress":
+        raise HTTPException(409, "Request already in progress")
+    return stored["response"]
+```
+`SET NX` is atomic; a `GET`-then-`SET` races and double-charges.
+
+**Dead letter queues:** after bounded retries, move the job to a DLQ with the payload, error, and traceback. **A DLQ without alerting and a replay path is deletion with extra steps.** Alert on depth; build the replay endpoint.
+
+---
+
+## 6. Retries, Circuit Breakers, and Backpressure
+
+*(Implementation: `BackendForAi.md` Ch 8.)*
+
+```
+ RETRY RULES
+   ✔ Retry at exactly ONE layer. Client + gateway + app each retrying 3×
+     is 27 requests to a struggling service from one user action.
+   ✔ Exponential backoff WITH FULL JITTER: delay = uniform(0, min(base·2ⁿ, cap))
+     Without jitter, every failed client retries at the same instant.
+   ✔ Cap TOTAL retry time, not just attempt count — 3 attempts with backoff
+     can consume 30 s of a 10 s request budget, making the outage worse.
+   ✘ NEVER retry a 4xx across providers — the request itself is bad and every
+     provider rejects it identically. You'd pay 3× for the same failure.
+   ⚠ A timed-out LLM call may have SUCCEEDED and charged you. Use an
+     idempotency key with the provider where supported.
+```
+
+```
+ CIRCUIT BREAKER — why it matters MORE for AI
+
+   When a provider has an incident, every request takes the full 120 s
+   timeout before failing. With 200 concurrent requests, your workers are
+   saturated with doomed calls for two minutes and HEALTHY endpoints stop
+   responding.
+
+   CLOSED ──(N failures)──► OPEN ──(after timeout)──► HALF-OPEN
+                             │                            │
+                             fail fast in ~1 µs      one probe: success→CLOSED
+                                                            failure→OPEN
+
+   A breaker turns a 120,000 ms failure into a 0.001 ms one.
+   One per provider, with a metric and an alert.
+```
+
+```
+ BACKPRESSURE
+   When you cannot keep up, REJECT rather than queue unboundedly.
+   ✔ Bounded queues; 429 with Retry-After when full
+   ✔ Semaphores on every fan-out — unbounded gather() exhausts pools and
+     trips provider rate limits (which is SLOWER than bounded concurrency)
+   ✔ Admission control: reject at the edge, don't accept work you can't do
+   ✘ An unbounded queue converts an overload into a total outage with
+     a very long tail
+```
+
+---
+
+## 7. Caching
+
+*(Full treatment: `BackendForAi.md` Ch 17.)* The system-design framing:
+
+```
+ In a normal backend, caching saves MILLISECONDS.
+ In an AI backend, caching saves SECONDS AND MONEY.
+
+ A 30% hit rate on a $50,000/month inference bill is $15,000/month,
+ recovered by a component you build in an afternoon. Nothing else in
+ this phase has that return.
+```
+
+```
+ THE FOUR CACHES, BY VALUE
+ ① PROVIDER PREFIX CACHE   stable content first in the prompt → ~10× cheaper
+                           prefix. Pure reordering. Do this first.
+ ② EMBEDDING CACHE         deterministic, never invalidates, 40–70% hit rate
+ ③ RETRIEVAL CACHE         keyed by query hash + corpus version
+ ④ RESPONSE CACHE          exact-match at temperature 0 only; semantic
+                           caching at ≥0.95 similarity, tenant-scoped
+
+ THE THREE FAILURE MODES
+   STAMPEDE      hot key expires, 1,000 concurrent misses hammer the source
+                 → single-flight lock (SET NX) + stale-while-revalidate
+   PENETRATION   requests for keys that don't exist always miss
+                 → cache negative results briefly
+   AVALANCHE     many keys written together expire together
+                 → jitter every TTL
+
+ ⚠ EVERY CACHE KEY NEEDS THE TENANT ID. A cache lookup bypasses every
+   authorization check you wrote.
+```
+
+---
+
+## 8. Rate Limiting
+
+```
+ FOUR LAYERS, EACH ANSWERING A DIFFERENT QUESTION
+
+ ① IP rate limit          "is this unauthenticated abuse?"     gateway
+ ② Per-key requests/min   "is this client too chatty?"          app
+ ③ Per-org token quota    "have they used their allowance?"     app
+ ④ Global spend circuit   "is something catastrophically wrong?" app
+
+ ④ IS THE ONE THAT SAVES YOU. Per-org limits assume the bug is in one
+   org's usage. A prompt loop, retry storm, or leaked key affects
+   everything at once — only a global ceiling stops it.
+```
+
+```
+ ALGORITHMS
+   Fixed window     simple; allows a 2× burst at the boundary
+   Sliding window   accurate; a Redis sorted set (ZREMRANGEBYSCORE + ZCARD)
+   Token bucket     allows bursts up to capacity; the best default
+   Leaky bucket     smooths output; used for outbound provider limiting
+
+ ⚠ IN-MEMORY RATE LIMITING IS WRONG with multiple workers or pods —
+   your effective limit is multiplied by the process count, and it
+   resets on every deploy. Use Redis.
+
+ ⚠ RATE-LIMIT YOUR OWN OUTBOUND CALLS TOO. Providers enforce both
+   requests/minute AND tokens/minute. Exceeding either costs latency.
+```
+
+---
+
+## 9. Scaling, Load Balancing, and Replication
+
+```
+ VERTICAL          bigger machine. Simple, has a ceiling, single point of failure.
+ HORIZONTAL        more machines. Requires statelessness. The default.
+
+ STATELESSNESS IS THE PREREQUISITE for horizontal scaling.
+ In AI systems the usual violation is a model loaded in-process (Phase 19).
+```
+
+```
+ LOAD BALANCING
+   Round-robin        fine for short requests
+   LEAST-CONNECTIONS  ← CORRECT for long-lived connections and streams;
+                        round-robin distributes connections evenly at creation
+                        but they accumulate unevenly
+   Consistent hashing when you need cache/session affinity
+   ⚠ Enable HTTP/2 — browsers cap HTTP/1.1 at ~6 connections per origin,
+     so a user with 7 tabs of your streaming app gets a silent hang.
+```
+
+```
+ DATABASE REPLICATION
+   Primary + read replicas: writes to one, reads spread across many.
+   ⚠ REPLICATION LAG (usually ms, occasionally seconds) means read-after-write
+     can return stale data. Route reads that must be fresh to the primary.
+
+ AI-SPECIFIC READ SPLIT
+   Vector search is read-heavy and CPU-intensive. Once volume is real,
+   route it to a replica so it doesn't compete with OLTP traffic.
+```
+
+**The connection-pool wall everyone hits:**
+```
+ pool_size × workers × pods  vs  Postgres max_connections (default 100)
+   10 × 4 × 20 = 800  →  "FATAL: sorry, too many clients already"
+
+ FIX: shrink the pool (async holds connections only during a query, not
+ during the 4 s LLM call), or PgBouncer in transaction mode.
+```
+
+---
+
+## 10. CAP, Consistency, and Distributed Transactions
+
+```
+ CAP: under a network Partition you choose Consistency or Availability.
+      (You never "choose CP or AP" in the absence of a partition —
+       that framing is the common misreading.)
+
+ WHAT TO CHOOSE, PER DATA TYPE, IN AN AI SYSTEM
+   Billing / usage counters     CONSISTENCY   (money must not be wrong)
+   Auth / permissions           CONSISTENCY   (fail closed)
+   Conversation history         availability  (a missing recent message is
+                                               survivable)
+   Vector index                 availability  (slightly stale retrieval is fine)
+   Cache                        availability  (it's a cache)
+```
+
+```
+ CONSISTENCY MODELS
+   Strong            every read sees the latest write. Expensive.
+   Read-your-writes  a user sees their own writes. Usually what people
+                     actually mean, and much cheaper.
+   Eventual          converges. Fine for search indexes and analytics.
+
+ ⚠ THE AI-SPECIFIC CASE: a user uploads a document and immediately asks
+   about it. Ingestion is async, so the document isn't indexed yet.
+   → This is NOT a consistency bug to fix with stronger guarantees.
+     It is a UX problem: show the job status, and say "still processing."
+```
+
+**Distributed transactions:** don't. Two-phase commit is fragile and slow. Use the **outbox pattern** — write the data change and the outbound message in the *same local transaction*, with a relay publishing committed rows:
+
+```python
+async def create_document(db, data):
+    doc = await repo.create(data)
+    db.add(OutboxMessage(topic="process_document",
+                         payload={"document_id": str(doc.id)}))
+    await db.commit()                    # ATOMIC: both, or neither
+```
+
+This eliminates both "committed but never enqueued" and "enqueued but never committed" using only your existing database. For multi-step processes with compensating actions, use the **saga pattern** — or better, a durable workflow engine (Phase 17 §10).
+
+---
+
+## 11. Distributed Locking
+
+```python
+# The correct primitive: SET NX with a TTL and a compare-and-delete release.
+token = secrets.token_urlsafe(16)
+acquired = await redis.set(f"lock:{key}", token, nx=True, ex=30)
+if acquired:
+    try:
+        ...
+    finally:
+        # ⚠ Lua CAS — release ONLY if we still hold it.
+        await redis.eval(
+            "if redis.call('get',KEYS[1])==ARGV[1] then "
+            "return redis.call('del',KEYS[1]) else return 0 end",
+            1, f"lock:{key}", token)
+```
+
+**Why the CAS release matters:** if your work outlives the 30 s TTL, another process acquires the lock, and a plain `DEL` would delete *their* lock — letting a third process in. Now two run concurrently and the mechanism has silently failed.
+
+**Where you actually need locks in AI systems:** cache stampede prevention (single-flight), scheduled-job leader election, and preventing duplicate ingestion of the same document.
+
+**Prefer designs that don't need locks.** Atomic operations (`INCR`, `SET NX`, a SQL `UPDATE ... WHERE balance >= amount`) are safer than locks. Redis locks are not safe under all failure modes — for correctness-critical mutual exclusion, use a database transaction.
+
+---
+
+## 12. High Availability & Fault Tolerance
+
+```
+ REMOVE SINGLE POINTS OF FAILURE
+   ✔ ≥3 API pods across ≥2 availability zones; PodDisruptionBudget
+   ✔ Database with automated failover (managed service, or Patroni)
+   ✔ Redis Sentinel or Cluster
+   ✔ MULTIPLE LLM PROVIDERS ← the AI-specific one. A single provider is a
+     single point of failure you do not control and cannot fix.
+
+ GRACEFUL DEGRADATION — decide BEFORE the incident, per dependency
+   ┌──────────────────┬──────────────────────────────────────────────────┐
+   │ Redis (cache)    │ serve uncached — slower, correct                 │
+   │ Redis (limits)   │ fail OPEN with an alarm + a cheap in-process cap │
+   │ Vector store     │ answer without retrieval, LABELLED; or 503 for   │
+   │                  │ RAG endpoints only                               │
+   │ LLM provider     │ fall back → cheaper model → retrieval-only → 503 │
+   │ Database         │ 503. There is no degraded mode for the source    │
+   │                  │ of truth.                                        │
+   │ Object storage   │ queue uploads; reads fail with 503               │
+   └──────────────────┴──────────────────────────────────────────────────┘
+
+ THE DEGRADATION LADDER FOR GENERATION
+   primary model → secondary provider (different outage domain)
+   → cheaper model → RETRIEVAL-ONLY with a clear label → 503
+
+ That "retrieval-only" tier is often the difference between a bad hour
+ and an outage. Users can still find their answer in the passages.
+```
+
+**Timeout budgets must decrease inward:**
+```
+ client 180 s > LB 150 s > app 120 s > LLM call 110 s > connect 5 s
+ If the LB times out first, the client gets a generic 504 and your app
+ learns nothing about what actually failed.
+```
+
+---
+
+## 13. Observability
+
+*(Implementation: Phase 19 and `BackendForAi.md` Ch 21.)* The system-design point:
+
+```
+ MONITORING answers questions you knew to ask (dashboards, alerts).
+ OBSERVABILITY answers questions you didn't (high-cardinality traces).
+
+ You need both. In a distributed AI system, the question you didn't know
+ to ask is usually "why was THIS request slow/wrong/expensive?" —
+ and only a trace with the request ID answers it.
+```
+
+```
+ THE MINIMUM VIABLE SET
+   ✔ A request ID generated at the edge, propagated everywhere, returned
+     to the client, and present on every log line
+   ✔ Structured JSON logs to stdout with tenant, model, tokens, and COST
+   ✔ RED metrics + TTFT + cost + saturation (loop lag, pools, queues)
+   ✔ Traces at 10% sampling, 100% on errors
+   ✔ Alerts on symptoms users feel, each with a runbook
+
+ Without the request ID, "it was wrong yesterday at 14:32" is unactionable.
+ With it, it's one query.
+```
+
+---
+
+## 14. Reference Architecture
+
+```
+                       ┌──────────────┐
+                       │  CDN / WAF   │  TLS, DDoS, IP limits
+                       └──────┬───────┘
+                       ┌──────▼───────┐
+                       │ API Gateway  │  auth, routing, size limits
+                       └──────┬───────┘
+             ┌────────────────┼────────────────┐
+             ▼                ▼                ▼
+      ┌────────────┐   ┌────────────┐   ┌────────────┐
+      │ API pods   │   │ API pods   │   │ API pods   │  stateless, HTTP/2,
+      │ (zone a)   │   │ (zone b)   │   │ (zone c)   │  least-connections
+      └─────┬──────┘   └────────────┘   └────────────┘
+            │
+   ┌────────┼──────────┬────────────┬─────────────┬──────────────┐
+   ▼        ▼          ▼            ▼             ▼              ▼
+┌──────┐ ┌──────┐ ┌─────────┐ ┌──────────┐ ┌───────────┐ ┌────────────┐
+│  PG  │ │Redis │ │ Vector  │ │    S3    │ │ LLM       │ │  Workers   │
+│ +RLS │ │cache │ │  store  │ │ documents│ │ gateway   │ │  (queues:  │
+│ +read│ │limits│ │per-tenant│ │          │ │ (multi-   │ │  io/cpu/   │
+│ repl │ │locks │ │         │ │          │ │  provider │ │  gpu/prio) │
+└──────┘ └──────┘ └─────────┘ └──────────┘ │  fallback)│ └────────────┘
+                                            └─────┬─────┘
+                                                  ▼
+                                          ┌───────────────┐
+                                          │ Inference tier│  GPU, vLLM,
+                                          │ (or provider  │  queue-scaled
+                                          │  APIs)        │
+                                          └───────────────┘
+   OUTBOX: PG → relay → queue    OBSERVABILITY: logs/metrics/traces + LLM traces
+```
+
+---
+
+## Common Mistakes
+
+```
+❌ Microservices before there's a scaling or hardware reason
+❌ Kafka for a workload doing thousands of events per day
+❌ Non-idempotent tasks with at-least-once delivery
+❌ Enqueue before commit (or commit then enqueue) without an outbox
+❌ Retries at every layer → 27× amplification onto a struggling service
+❌ Retry without jitter → synchronised thundering herd on recovery
+❌ Falling back to another provider on a 4xx
+❌ No circuit breaker → a provider incident saturates your workers
+❌ Unbounded queues → overload becomes a long-tailed total outage
+❌ Unbounded fan-out (gather over 10,000 items) → pool exhaustion and 429s
+❌ In-memory rate limiting with multiple workers
+❌ No global spend ceiling — only per-org limits
+❌ Cache keys without a tenant ID
+❌ Round-robin load balancing for long-lived streams
+❌ pool_size × workers × pods > max_connections
+❌ Redis lock released with DEL instead of a compare-and-delete
+❌ Trying to fix async-ingestion "staleness" with stronger consistency
+   instead of showing job status
+❌ Single LLM provider — a SPOF you don't control
+❌ No decided degradation behaviour per dependency
+```
+
+---
+
+## Checklist
+
+```
+ARCHITECTURE
+[ ] Modular monolith unless a concrete split reason exists
+[ ] API / inference / worker tiers separated (different scaling + hardware)
+[ ] URL space grouped by domain so extraction is a routing change
+[ ] Gateway does generic HTTP hygiene; app does identity-aware policy
+
+MESSAGING
+[ ] Queue chosen by need, not fashion (Redis Streams is usually enough)
+[ ] Every task idempotent (status guard, stable IDs, upsert, idem keys)
+[ ] Outbox pattern wherever a DB write and an enqueue must agree
+[ ] Bounded retries + DLQ + alerting + a replay path
+
+RESILIENCE
+[ ] Retry at ONE layer, with full jitter and a total-time cap
+[ ] Circuit breaker per external dependency, with metrics
+[ ] Timeout budgets decreasing inward
+[ ] Bounded queues and semaphores on every fan-out
+[ ] Degradation ladder decided per dependency, and tested in a game day
+[ ] Multiple LLM providers configured
+
+SCALE
+[ ] Stateless services; no model in the API process
+[ ] Least-connections + HTTP/2 for streaming
+[ ] Connection pool arithmetic verified against max_connections
+[ ] Vector search on a read replica once volume is real
+[ ] Four rate-limit layers including a GLOBAL spend ceiling
+
+CONSISTENCY
+[ ] Consistency requirement chosen per data type, not globally
+[ ] No distributed transactions; outbox or saga instead
+[ ] Locks only where atomic operations can't do the job; CAS release
+
+OBSERVABILITY
+[ ] Request ID at the edge, propagated, returned, on every log line
+[ ] Cost per request logged and alerted on
+[ ] Traces sampled at 10%, forced at 100% on errors
+[ ] Alerts on user-visible symptoms, each with a runbook
+```
+
+---
+
+**Next:** Phase 21 — assembling all of this into the specific shape of a production AI system.
