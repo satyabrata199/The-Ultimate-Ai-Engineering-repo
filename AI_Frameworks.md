@@ -1,4 +1,4 @@
-# Phase 13 — AI Frameworks
+# AI Frameworks
 
 > There are ~15 frameworks competing for the same job. This phase is about knowing what each one actually does, which three you should learn, and when writing 200 lines yourself beats adopting any of them.
 
