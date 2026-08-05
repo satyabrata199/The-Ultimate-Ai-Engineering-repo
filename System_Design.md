@@ -1,4 +1,4 @@
-# Phase 20 — System Design
+# System Design
 
 > Distributed systems fundamentals, filtered for what AI workloads actually stress. The patterns are classical; what's different is the scale of the numbers — a 4-second dependency you don't control, costing money per call.
 
