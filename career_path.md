@@ -1,3 +1,6 @@
+- https://chatgpt.com/share/6af7a8f5-f9fc-83ec-b3b7-556b08446b9b
+
+
 # **Where your career is heading — and where you should go next**
 
 I'll give you an honest career assessment, not just a list of popular AI technologies.
