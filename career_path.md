@@ -644,3 +644,5 @@ This will help determine whether your next move should be Junior AI Backend Engi
 I can then turn this career direction into a structured weekly development and career-progress review.
 
 🎯Weekly career progress reviewTap to set up
+
+- project 1 - <img width="1376" height="768" alt="image" src="https://github.com/user-attachments/assets/19edae25-d874-467c-8b5c-d2765a4caa39" />
